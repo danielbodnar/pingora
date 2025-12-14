@@ -45,7 +45,10 @@ use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
@@ -111,6 +114,7 @@ where
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector<C>,
     shutdown: Notify,
+    shutdown_flag: Arc<AtomicBool>,
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
@@ -124,6 +128,7 @@ impl<SV> HttpProxy<SV, ()> {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
             h2_options: None,
             downstream_modules: HttpModules::new(),
@@ -154,6 +159,7 @@ where
             inner,
             client_upstream,
             shutdown: Notify::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
             downstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
@@ -401,12 +407,15 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Flag that is set when the shutdown process has begun.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl Session {
     fn new(
         downstream_session: impl Into<Box<HttpSession>>,
         downstream_modules: &HttpModules,
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         Session {
             downstream_session: downstream_session.into(),
@@ -419,22 +428,33 @@ impl Session {
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            shutdown_flag,
         }
     }
 
     /// Create a new [Session] from the given [Stream]
     ///
-    /// This function is mostly used for testing and mocking.
+    /// This function is mostly used for testing and mocking, given the downstream modules and
+    /// shutdown flags will never be set.
     pub fn new_h1(stream: Stream) -> Self {
         let modules = HttpModules::new();
-        Self::new(Box::new(HttpSession::new_http1(stream)), &modules)
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            &modules,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// Create a new [Session] from the given [Stream] with modules
     ///
-    /// This function is mostly used for testing and mocking.
+    /// This function is mostly used for testing and mocking, given the shutdown flag will never be
+    /// set.
     pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
-        Self::new(Box::new(HttpSession::new_http1(stream)), downstream_modules)
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            downstream_modules,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
@@ -470,6 +490,16 @@ impl Session {
             .response_header_filter(&mut resp, end_of_stream)
             .await?;
         self.downstream_session.write_response_header(resp).await
+    }
+
+    /// Similar to `write_response_header()`, this fn will clone the `resp` internally
+    pub async fn write_response_header_ref(
+        &mut self,
+        resp: &ResponseHeader,
+        end_of_stream: bool,
+    ) -> Result<(), Box<Error>> {
+        self.write_response_header(Box::new(resp.clone()), end_of_stream)
+            .await
     }
 
     /// Write the given HTTP response body chunk to the downstream
@@ -557,6 +587,11 @@ impl Session {
     /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
         self.upstream_body_bytes_received = n;
+    }
+
+    /// Is the proxy process in the process of shutting down (e.g. due to graceful upgrade)?
+    pub fn is_process_shutting_down(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Acquire)
     }
 
     pub fn downstream_custom_message(
@@ -711,7 +746,7 @@ where
                         session.cache.disable(NoCacheReason::DeclinedToUpstream);
                     }
                     if session.response_written().is_none() {
-                        match session.write_response_header_ref(&BAD_GATEWAY).await {
+                        match session.write_response_header_ref(&BAD_GATEWAY, true).await {
                             Ok(()) => {}
                             Err(e) => {
                                 return self
@@ -900,7 +935,11 @@ where
         debug!("starting subrequest");
 
         let mut session = match self.handle_new_request(session).await {
-            Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
+            Some(downstream_session) => Session::new(
+                downstream_session,
+                &self.downstream_modules,
+                self.shutdown_flag.clone(),
+            ),
             None => return, // bad request
         };
 
@@ -962,25 +1001,33 @@ where
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
-        _shutdown: &ShutdownWatch,
+        shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
-        let session = match self.handle_new_request(session).await {
-            Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
+        let mut session = match self.handle_new_request(session).await {
+            Some(downstream_session) => Session::new(
+                downstream_session,
+                &self.downstream_modules,
+                self.shutdown_flag.clone(),
+            ),
             None => return None, // bad request
         };
+
+        if *shutdown.borrow() {
+            // stop downstream from reusing if this service is shutting down soon
+            session.set_keepalive(None);
+        }
 
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await
     }
 
     async fn http_cleanup(&self) {
+        self.shutdown_flag.store(true, Ordering::Release);
         // Notify all keepalived requests blocking on read_request() to abort
         self.shutdown.notify_waiters();
-
-        // TODO: impl shutting down flag so that we don't need to read stack.is_shutting_down()
     }
 
     fn server_options(&self) -> Option<&HttpServerOptions> {
