@@ -6,6 +6,8 @@ on:
       - master
     paths:
       - "**/Cargo.toml"
+  schedule:
+    - cron: "0 2 * * *" # run at 2 AM UTC
 
 permissions:
   contents: read
