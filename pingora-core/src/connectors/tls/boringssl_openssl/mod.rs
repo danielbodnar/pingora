@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -193,7 +193,7 @@ where
         }
     }
 
-    if let Some(curve) = peer.get_peer_options().and_then(|o| o.curves) {
+    if let Some(curve) = peer.get_peer_options().and_then(|o| o.curves.as_deref()) {
         ssl_set_groups_list(&mut ssl_conf, curve).or_err(InternalError, "invalid curves")?;
     }
 
@@ -246,7 +246,11 @@ where
     }
 
     clear_error_stack();
-    let connect_future = handshake(ssl_conf, peer.sni(), stream);
+
+    let complete_hook = peer
+        .get_peer_options()
+        .and_then(|o| o.upstream_tls_handshake_complete_hook.clone());
+    let connect_future = handshake(ssl_conf, peer.sni(), stream, complete_hook);
 
     match peer.connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {

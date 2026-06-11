@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_single_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.insert_header("foo", "bar").unwrap();
         req.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_multiple_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.append_header("FoO", "Bar").unwrap();
         req.append_header("fOO", "bar").unwrap();
         req.append_header("BAZ", "baR").unwrap();

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,24 @@ use pingora_cache::{
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
+use std::any::Any;
 use std::time::Duration;
+
+/// Context for proxy warning logs that can be suppressed by
+/// [`ProxyHttp::suppress_proxy_warn_log`].
+///
+/// These contexts are distinct from final proxy errors, which are handled by
+/// [`ProxyHttp::suppress_error_log`].
+///
+/// Experimental: this API may change or be removed until indicated otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProxyWarnLogContext {
+    /// A proxy upstream attempt failed with a retryable error.
+    UpstreamRetry,
+    /// A downstream error was ignored so cache fill could continue.
+    DownstreamCache,
+}
 
 /// The interface to control the HTTP proxy
 ///
@@ -56,6 +73,23 @@ pub trait ProxyHttp {
         modules.add_module(ResponseCompressionBuilder::enable(0));
     }
 
+    /// Set up upstream modules.
+    ///
+    /// In this phase, users can add [HttpModules] that will process upstream responses
+    /// **before** `upstream_compression`. This is the correct place to register modules
+    /// that need to observe the raw (pre-compression) upstream response body, such as
+    /// a dictionary store for shared dictionary compression.
+    ///
+    /// Upstream modules are ordered by [`HttpModuleBuilder::order()`]: higher values run
+    /// first. They are invoked on each upstream response task (header, body, trailers)
+    /// before `upstream_compression` processes the task.
+    ///
+    /// By default this method does nothing.
+    ///
+    /// This method requires the `upstream_modules` feature to be enabled.
+    #[cfg(feature = "upstream_modules")]
+    fn init_upstream_modules(&self, _modules: &mut HttpModules) {}
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
@@ -90,7 +124,7 @@ pub trait ProxyHttp {
 
     /// Returns whether this session is allowed to spawn subrequests.
     ///
-    /// This function is checked after [`early_request_filter`] to allow that filter to configure
+    /// This function is checked after [Self::early_request_filter] to allow that filter to configure
     /// this if required. This will also run for subrequests themselves, which may allowed to spawn
     /// their own subrequests.
     ///
@@ -130,18 +164,31 @@ pub trait ProxyHttp {
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
-    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 
-    /// This callback generates the cache key
+    /// This callback generates the cache key.
     ///
-    /// This callback is called only when cache is enabled for this request
+    /// This callback is called only when cache is enabled for this request.
     ///
-    /// By default this callback returns a default cache key generated from the request.
-    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
-        let req_header = session.req_header();
-        Ok(CacheKey::default(req_header))
+    /// There is no sensible default cache key for all proxy applications. The
+    /// correct key depends on which request properties affect upstream responses
+    /// (e.g. `Vary` headers, custom request filters that modify the origin host).
+    /// Getting this wrong leads to cache poisoning.
+    ///
+    /// See `pingora-proxy/tests/utils/server_utils.rs` for a minimal (not
+    /// production-ready) reference implementation.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics. You **must** override this method when
+    /// caching is enabled.
+    fn cache_key_callback(&self, _session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        unimplemented!("cache_key_callback must be implemented when caching is enabled")
     }
 
     /// This callback is invoked when a cacheable response is ready to be admitted to cache.
@@ -271,6 +318,39 @@ pub trait ProxyHttp {
         &self,
         _session: &mut Session,
         _upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    /// Adjust upstream modules before they process the response header.
+    ///
+    /// This filter is called when the upstream response header arrives, before upstream modules
+    /// (such as `upstream_compression`) run their response header filter. Use this to configure
+    /// module behavior based on the response, e.g. setting a dictionary for dictionary-based
+    /// content encoding.
+    ///
+    /// This filter may be called more than once per request if the upstream sends informational
+    /// (1xx) response headers before the final response. Implementations can check
+    /// [`upstream_response.status.is_informational()`](http::StatusCode::is_informational) to
+    /// distinguish informational headers from the final response if needed.
+    ///
+    /// `end_of_stream` indicates whether the response header is also the end of the response
+    /// (e.g. for HEAD responses or 304s with no body).
+    ///
+    /// The response header is provided as an immutable reference. To modify the response header
+    /// itself, use [`Self::upstream_response_filter()`] instead.
+    ///
+    /// This filter requires the `upstream_modules` feature to be enabled.
+    #[cfg(feature = "upstream_modules")]
+    async fn adjust_upstream_modules(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
@@ -425,8 +505,67 @@ pub trait ProxyHttp {
     {
     }
 
+    /// Called after [`Self::logging`] when the downstream connection will be reused for another
+    /// HTTP/1.x keepalive request. The returned value, if any, will be carried to the next
+    /// request on this connection and delivered via [`Self::on_connection_reuse`].
+    ///
+    /// Use this to persist debugging or timing information across keepalive requests.
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is also called on error paths when the downstream connection is eligible for reuse.
+    ///
+    /// The default implementation returns `None` (no context persisted).
+    fn persist_connection_context(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Called at the start of a new request on a reused HTTP/1.x keepalive connection,
+    /// before [`Self::early_request_filter`]. The `prev_ctx` argument is the value returned
+    /// by [`Self::persist_connection_context`] from the previous request on this connection.
+    ///
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is not called when `persist_connection_context` returned `None` on the previous request.
+    ///
+    /// Use this to transfer state from the previous request into the new request's context.
+    fn on_connection_reuse(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _prev_ctx: Box<dyn Any + Send + Sync>,
+    ) {
+    }
+
     /// A value of true means that the log message will be suppressed. The default value is false.
+    ///
+    /// See also: [`Self::suppress_proxy_warn_log`].
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
+        false
+    }
+
+    /// A value of true means that the proxy warning log message will be suppressed.
+    /// The default value is false.
+    ///
+    /// This hook currently applies to retryable proxy upstream failures and downstream errors
+    /// ignored while cache fill continues. Final proxy errors are still handled by
+    /// [`Self::suppress_error_log`].
+    ///
+    /// Suppressing retry warning logs can remove the only per-retry audit record. Callers that
+    /// suppress these logs should provide alternative observability, such as metrics or logs in
+    /// their implementation of this hook.
+    ///
+    /// This hook runs inline on retry and cache-error paths, so implementations should be cheap.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        _context: ProxyWarnLogContext,
+    ) -> bool {
         false
     }
 
